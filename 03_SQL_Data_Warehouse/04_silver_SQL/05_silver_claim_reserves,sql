@@ -1,0 +1,244 @@
+/*======================================================================================
+  SILVER LOAD (ONE-CLICK): silver.claim_reserves
+  Source: bronze.claim_reserves_raw
+
+  Fixes:
+   - SnapshotDate parsing (dd/mm/yyyy etc.)
+   - ReserveAgeMonths calculation
+  Prevents:
+   - "Missing rows" confusion by writing bad rows to silver.claim_reserves_reject
+
+  Key technical point:
+   - Uses #Classified temp table so we can reuse the transformed dataset
+     across multiple INSERT statements (CTE scope issue avoided).
+
+  Assumes silver.claim_reserves has (as per your screenshots):
+    ReserveID, ClaimID, SnapshotDate, ReserveAmount, PreviousReserve, ReserveChange,
+    ReserveStatus, ReserveType, ReserveMovementType, LargeReserveFlag, LatestSnapshotFlag,
+    ReserveAgeMonths, BronzeLoadDts, SourceFile, SilverLoadDts
+
+======================================================================================*/
+
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+BEGIN TRY
+    BEGIN TRAN;
+
+    /*------------------------------------------------------------
+      0) Fail fast: required objects
+    ------------------------------------------------------------*/
+    IF OBJECT_ID('bronze.claim_reserves_raw','U') IS NULL
+        THROW 53001, 'Missing source table: bronze.claim_reserves_raw', 1;
+
+    IF OBJECT_ID('silver.claim_reserves','U') IS NULL
+        THROW 53002, 'Missing target table: silver.claim_reserves', 1;
+
+    /*------------------------------------------------------------
+      1) Recreate reject table to guarantee expected schema
+         (dev-friendly; avoids schema drift problems)
+    ------------------------------------------------------------*/
+    IF OBJECT_ID('silver.claim_reserves_reject','U') IS NOT NULL
+        DROP TABLE silver.claim_reserves_reject;
+
+    CREATE TABLE silver.claim_reserves_reject
+    (
+        RejectID            int IDENTITY(1,1) NOT NULL CONSTRAINT PK_claim_reserves_reject PRIMARY KEY,
+        ReserveID           varchar(30) NULL,
+        ClaimID             varchar(30) NULL,
+        SnapshotDateRaw     varchar(50) NULL,
+        ReserveAmountRaw    varchar(50) NULL,
+        PreviousReserveRaw  varchar(50) NULL,
+        ReserveChangeRaw    varchar(50) NULL,
+        RejectReason        varchar(400) NOT NULL,
+        BronzeLoadDts       datetime2(0) NULL,
+        SourceFile          varchar(255) NULL,
+        SilverLoadDts       datetime2(0) NOT NULL CONSTRAINT DF_claim_reserves_reject_SilverLoadDts DEFAULT SYSUTCDATETIME()
+    );
+
+    /*------------------------------------------------------------
+      2) Full refresh target
+    ------------------------------------------------------------*/
+    TRUNCATE TABLE silver.claim_reserves;
+
+    /*------------------------------------------------------------
+      3) Build a reusable transformed dataset (#Classified)
+         - parse dates
+         - parse decimals
+         - compute RejectReason + IsGood
+    ------------------------------------------------------------*/
+    IF OBJECT_ID('tempdb..#Classified') IS NOT NULL
+        DROP TABLE #Classified;
+
+    SELECT
+        ReserveID = NULLIF(LTRIM(RTRIM(b.ReserveID)), ''),
+        ClaimID   = NULLIF(LTRIM(RTRIM(b.ClaimID)), ''),
+
+        SnapshotDateRaw = b.SnapshotDate,
+
+        SnapshotDateParsed =
+            COALESCE(
+                TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 103), -- dd/mm/yyyy
+                TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 23),  -- yyyy-mm-dd
+                TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 111), -- yyyy/mm/dd
+                TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 105), -- dd-mm-yyyy
+                TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10))       -- fallback
+            ),
+
+        ReserveAmountRaw   = b.ReserveAmount,
+        PreviousReserveRaw = b.PreviousReserve,
+        ReserveChangeRaw   = b.ReserveChange,
+
+        ReserveAmountParsed =
+            TRY_CONVERT(decimal(18,2),
+                REPLACE(REPLACE(REPLACE(REPLACE(b.ReserveAmount, ',', ''), '£', ''), '$', ''), ' ', '')
+            ),
+        PreviousReserveParsed =
+            TRY_CONVERT(decimal(18,2),
+                REPLACE(REPLACE(REPLACE(REPLACE(b.PreviousReserve, ',', ''), '£', ''), '$', ''), ' ', '')
+            ),
+        ReserveChangeParsed =
+            TRY_CONVERT(decimal(18,2),
+                REPLACE(REPLACE(REPLACE(REPLACE(b.ReserveChange, ',', ''), '£', ''), '$', ''), ' ', '')
+            ),
+
+        ReserveStatus       = NULLIF(LTRIM(RTRIM(b.ReserveStatus)), ''),
+        ReserveType         = NULLIF(LTRIM(RTRIM(b.ReserveType)), ''),
+        ReserveMovementType = NULLIF(LTRIM(RTRIM(b.ReserveMovementType)), ''),
+
+        LargeReserveFlag   = TRY_CONVERT(int, NULLIF(LTRIM(RTRIM(b.LargeReserveFlag)), '')),
+        LatestSnapshotFlag = TRY_CONVERT(int, NULLIF(LTRIM(RTRIM(b.LatestSnapshotFlag)), '')),
+
+        BronzeLoadDts = COALESCE(b.BronzeLoadDts, SYSUTCDATETIME()),
+        SourceFile    = b.SourceFile,
+
+        RejectReason =
+            CONCAT(
+                CASE WHEN NULLIF(LTRIM(RTRIM(b.ReserveID)), '') IS NULL THEN 'ReserveID missing; ' ELSE '' END,
+                CASE WHEN NULLIF(LTRIM(RTRIM(b.ClaimID)), '') IS NULL THEN 'ClaimID missing; ' ELSE '' END,
+                CASE WHEN COALESCE(
+                           TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 103),
+                           TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 23),
+                           TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 111),
+                           TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 105),
+                           TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10))
+                       ) IS NULL THEN 'SnapshotDate invalid/missing; ' ELSE '' END,
+                CASE WHEN TRY_CONVERT(decimal(18,2),
+                           REPLACE(REPLACE(REPLACE(REPLACE(b.ReserveAmount, ',', ''), '£', ''), '$', ''), ' ', '')
+                       ) IS NULL THEN 'ReserveAmount invalid/missing; ' ELSE '' END,
+                CASE WHEN TRY_CONVERT(decimal(18,2),
+                           REPLACE(REPLACE(REPLACE(REPLACE(b.PreviousReserve, ',', ''), '£', ''), '$', ''), ' ', '')
+                       ) IS NULL THEN 'PreviousReserve invalid/missing; ' ELSE '' END,
+                CASE WHEN TRY_CONVERT(decimal(18,2),
+                           REPLACE(REPLACE(REPLACE(REPLACE(b.ReserveChange, ',', ''), '£', ''), '$', ''), ' ', '')
+                       ) IS NULL THEN 'ReserveChange invalid/missing; ' ELSE '' END
+            ),
+
+        IsGood =
+            CASE
+                WHEN NULLIF(LTRIM(RTRIM(b.ReserveID)), '') IS NOT NULL
+                 AND NULLIF(LTRIM(RTRIM(b.ClaimID)), '') IS NOT NULL
+                 AND COALESCE(
+                        TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 103),
+                        TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 23),
+                        TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 111),
+                        TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10), 105),
+                        TRY_CONVERT(date, LEFT(LTRIM(RTRIM(REPLACE(b.SnapshotDate, CHAR(160), ' '))), 10))
+                    ) IS NOT NULL
+                 AND TRY_CONVERT(decimal(18,2), REPLACE(REPLACE(REPLACE(REPLACE(b.ReserveAmount, ',', ''), '£', ''), '$', ''), ' ', '')) IS NOT NULL
+                 AND TRY_CONVERT(decimal(18,2), REPLACE(REPLACE(REPLACE(REPLACE(b.PreviousReserve, ',', ''), '£', ''), '$', ''), ' ', '')) IS NOT NULL
+                 AND TRY_CONVERT(decimal(18,2), REPLACE(REPLACE(REPLACE(REPLACE(b.ReserveChange, ',', ''), '£', ''), '$', ''), ' ', '')) IS NOT NULL
+                THEN 1 ELSE 0
+            END
+    INTO #Classified
+    FROM bronze.claim_reserves_raw b;
+
+    /*------------------------------------------------------------
+      4) Load GOOD rows into silver.claim_reserves
+    ------------------------------------------------------------*/
+    INSERT INTO silver.claim_reserves
+    (
+        ReserveID,
+        ClaimID,
+        SnapshotDate,
+        ReserveAmount,
+        PreviousReserve,
+        ReserveChange,
+        ReserveStatus,
+        ReserveType,
+        ReserveMovementType,
+        LargeReserveFlag,
+        LatestSnapshotFlag,
+        ReserveAgeMonths,
+        BronzeLoadDts,
+        SourceFile,
+        SilverLoadDts
+    )
+    SELECT
+        ReserveID,
+        ClaimID,
+        SnapshotDateParsed,
+        ReserveAmountParsed,
+        PreviousReserveParsed,
+        ReserveChangeParsed,
+        ReserveStatus,
+        ReserveType,
+        ReserveMovementType,
+        LargeReserveFlag,
+        LatestSnapshotFlag,
+        DATEDIFF(month, SnapshotDateParsed, CAST(GETDATE() AS date)) AS ReserveAgeMonths,
+        BronzeLoadDts,
+        SourceFile,
+        SYSUTCDATETIME() AS SilverLoadDts
+    FROM #Classified
+    WHERE IsGood = 1;
+
+    /*------------------------------------------------------------
+      5) Load BAD rows into reject table (so nothing disappears)
+    ------------------------------------------------------------*/
+    INSERT INTO silver.claim_reserves_reject
+    (
+        ReserveID,
+        ClaimID,
+        SnapshotDateRaw,
+        ReserveAmountRaw,
+        PreviousReserveRaw,
+        ReserveChangeRaw,
+        RejectReason,
+        BronzeLoadDts,
+        SourceFile
+    )
+    SELECT
+        ReserveID,
+        ClaimID,
+        SnapshotDateRaw,
+        ReserveAmountRaw,
+        PreviousReserveRaw,
+        ReserveChangeRaw,
+        NULLIF(RejectReason, '') AS RejectReason,
+        BronzeLoadDts,
+        SourceFile
+    FROM #Classified
+    WHERE IsGood = 0;
+
+    /*------------------------------------------------------------
+      6) Reconciliation + Null checks
+    ------------------------------------------------------------*/
+    SELECT
+        (SELECT COUNT(*) FROM bronze.claim_reserves_raw) AS BronzeRows,
+        (SELECT COUNT(*) FROM silver.claim_reserves) AS SilverRows,
+        (SELECT COUNT(*) FROM silver.claim_reserves_reject) AS RejectRows,
+        (SELECT COUNT(*) FROM silver.claim_reserves)
+        + (SELECT COUNT(*) FROM silver.claim_reserves_reject) AS SilverPlusReject,
+        (SELECT COUNT(*) FROM silver.claim_reserves WHERE SnapshotDate IS NULL) AS NullSnapshotDateInSilver,
+        (SELECT COUNT(*) FROM silver.claim_reserves WHERE ReserveAgeMonths IS NULL) AS NullReserveAgeMonthsInSilver;
+
+    COMMIT;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK;
+    THROW;
+END CATCH;
+GO
+
+
