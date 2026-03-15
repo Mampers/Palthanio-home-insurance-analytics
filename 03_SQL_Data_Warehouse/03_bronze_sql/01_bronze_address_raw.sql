@@ -1,100 +1,84 @@
-/*=========================================================
-  BRONZE LOAD: Address
-  Source: stg.address
-  Target: bronze.address_raw
+/*==============================================================================
+  BRONZE: address_raw (MATCHES address_enchanched.csv EXACTLY)
+  - Creates bronze.address_raw with the 19 CSV columns (in correct order)
+  - BULK INSERT loads cleanly (no column shifting)
+  - Adds Bronze metadata columns AFTER load
+==============================================================================*/
 
-  Notes:
-  - Bronze is "raw + metadata", minimal/no transformation.
-  - Table is cloned from stg.address to guarantee perfect alignment.
-=========================================================*/
+SET NOCOUNT ON;
 
------------------------------------------------------------
--- 0) Ensure bronze schema exists
------------------------------------------------------------
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'bronze')
-BEGIN
-    EXEC('CREATE SCHEMA bronze');
-END
-GO
+BEGIN TRY
 
------------------------------------------------------------
--- 1) Drop & recreate bronze table (clone stg schema)
------------------------------------------------------------
-DROP TABLE IF EXISTS bronze.address_raw;
-GO
+    /* 0) Ensure schema */
+    IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'bronze')
+        EXEC('CREATE SCHEMA bronze;');
 
--- Clone structure (0 rows) from staging
-SELECT TOP (0)
-    *
-INTO bronze.address_raw
-FROM stg.address;
-GO
+    /* 1) Reset table */
+    IF OBJECT_ID('bronze.address_raw','U') IS NOT NULL
+        DROP TABLE bronze.address_raw;
 
------------------------------------------------------------
--- 2) Add Bronze metadata columns
------------------------------------------------------------
-ALTER TABLE bronze.address_raw
-ADD
-    BronzeLoadDts datetime2(0) NOT NULL
-        CONSTRAINT DF_bronze_address_raw_BronzeLoadDts DEFAULT SYSUTCDATETIME(),
-    SourceFile varchar(260) NULL;
-GO
+    /* 2) Create table to match CSV header EXACTLY (19 columns) */
+    CREATE TABLE bronze.address_raw (
+        AddressID            varchar(50)    NULL,
+        CustomerID           varchar(50)    NULL,
+        AddressLine1         varchar(200)   NULL,
+        AddressLine2         varchar(200)   NULL,
+        City                 varchar(100)   NULL,
+        County               varchar(100)   NULL,
+        PostcodeArea         varchar(20)    NULL,
+        PostcodeDistrict     varchar(20)    NULL,
+        Region               varchar(100)   NULL,
+        Postcode             varchar(20)    NULL,
+        Country              varchar(100)   NULL,
+        PropertyType         varchar(100)   NULL,
+        Tenure               varchar(50)    NULL,
+        BuildYear            varchar(10)    NULL,
+        Bedrooms             varchar(10)    NULL,
+        HouseSizeSqFt        varchar(20)    NULL,
+        PropertySizeBand     varchar(50)    NULL,
+        PropertyAgeBand      varchar(50)    NULL,
+        RebuildCostEstimate  varchar(50)    NULL
+    );
 
------------------------------------------------------------
--- 3) Load data from stg into bronze
---    (Fixed syntax: no empty column list)
------------------------------------------------------------
-INSERT INTO bronze.address_raw
-SELECT *
-FROM stg.address;
-GO
+    /* 3) BULK INSERT (update filepath if needed) */
+    DECLARE @FilePath varchar(4000) =
+        'C:\Users\Paul Mampilly\Documents\ChatGPT Datasets\Home Insurance\CSV Datasets\Calibrated Raw Data\Enchanced\address_enchanched.csv';
 
------------------------------------------------------------
--- 4) Optional: Stamp the source filename for lineage
---    (Change filename if needed)
------------------------------------------------------------
-UPDATE bronze.address_raw
-SET SourceFile = 'address_enchanched.csv'
-WHERE SourceFile IS NULL;
-GO
+    DECLARE @BulkSql nvarchar(max) = N'
+BULK INSERT bronze.address_raw
+FROM ''' + REPLACE(@FilePath,'''','''''') + N'''
+WITH (
+    FIRSTROW = 2,
+    FIELDTERMINATOR = '','',
+    ROWTERMINATOR = ''0x0a'',
+    TABLOCK,
+    CODEPAGE = ''65001'',
+    MAXERRORS = 1000
+);';
 
------------------------------------------------------------
--- 5) Validation Checks
------------------------------------------------------------
+    EXEC sp_executesql @BulkSql;
 
--- 5A) Row counts (should match)
-SELECT 'stg.address' AS TableName, COUNT(*) AS RC
-FROM stg.address
-UNION ALL
-SELECT 'bronze.address_raw', COUNT(*)
-FROM bronze.address_raw;
-GO
+    /* 4) Add Bronze metadata AFTER load (so BULK alignment stays correct) */
+    ALTER TABLE bronze.address_raw
+        ADD BronzeLoadDts datetime2(0) NOT NULL CONSTRAINT DF_bronze_address_raw_BronzeLoadDts DEFAULT SYSUTCDATETIME();
 
--- 5B) Quick sample
-SELECT TOP (20) *
-FROM bronze.address_raw
-ORDER BY BronzeLoadDts DESC;
-GO
+    ALTER TABLE bronze.address_raw
+        ADD SourceFile varchar(260) NULL;
 
--- 5C) Duplicate AddressID check (ideally 0 rows)
---     If your AddressID is meant to be unique, duplicates indicate data issues upstream.
-SELECT AddressID, COUNT(*) AS Cnt
-FROM bronze.address_raw
-GROUP BY AddressID
-HAVING COUNT(*) > 1;
-GO
+    /* 5) Stamp SourceFile for all loaded rows */
+    UPDATE bronze.address_raw
+    SET SourceFile = @FilePath
+    WHERE SourceFile IS NULL;
 
--- 5D) Null/blank key checks
-SELECT
-    SUM(CASE WHEN AddressID  IS NULL OR LTRIM(RTRIM(AddressID))  = '' THEN 1 ELSE 0 END) AS NullOrBlank_AddressID,
-    SUM(CASE WHEN CustomerID IS NULL OR LTRIM(RTRIM(CustomerID)) = '' THEN 1 ELSE 0 END) AS NullOrBlank_CustomerID
-FROM bronze.address_raw;
-GO
+    /* 6) Validate */
+    SELECT COUNT(*) AS BronzeCount FROM bronze.address_raw;
 
--- 5E) Basic weird-character smoke test for Postcode (tabs/newlines)
-SELECT TOP (50) Postcode
-FROM bronze.address_raw
-WHERE Postcode LIKE '%' + CHAR(9)  + '%'
-   OR Postcode LIKE '%' + CHAR(10) + '%'
-   OR Postcode LIKE '%' + CHAR(13) + '%';
-GO
+    SELECT TOP 50 *
+    FROM bronze.address_raw
+    ORDER BY AddressID;
+
+END TRY
+BEGIN CATCH
+    PRINT 'ERROR: ' + ERROR_MESSAGE();
+    THROW;
+END CATCH;
